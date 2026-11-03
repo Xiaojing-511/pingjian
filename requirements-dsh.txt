@@ -1,0 +1,2 @@
+# 只在 Linux 容器或 macOS 14+ 上安装。本机若是 Python 3.8，不要装进旧虚拟环境。
+deepseek-harness-sdk

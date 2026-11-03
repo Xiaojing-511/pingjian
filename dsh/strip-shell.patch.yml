@@ -1,0 +1,9 @@
+# 关掉 sdk-minimal 自带的 shell。当前 SDK 的补丁按 id 覆盖条目，不认 remove。
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: terminal-bash
+  disabled: true
+- id: terminal-pwsh
+  disabled: true

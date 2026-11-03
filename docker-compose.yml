@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8787:8787"
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DSH_HOME: /opt/pingjian/dsh
+      PINGJIAN_INTERNAL_BASE: http://127.0.0.1:8787
