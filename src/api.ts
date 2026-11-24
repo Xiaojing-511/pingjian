@@ -205,6 +205,40 @@ export async function saveOpportunity(videoId: string, patch: Record<string, unk
   })
 }
 
+export async function downloadExampleComments() {
+  const blob = await apiBlob("/api/examples/comments")
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement("a")
+  link.href = url
+  link.download = "示例评论.xlsx"
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+async function apiBlob(path: string, allowRefresh = true): Promise<Blob> {
+  if (allowRefresh) await ensureFreshToken()
+  const headers = new Headers()
+  const token = getToken()
+  if (token) headers.set("Authorization", `Bearer ${token}`)
+  const response = await fetch(path, { headers })
+  if (response.status === 401 && allowRefresh) {
+    const renewed = await refreshSession()
+    if (renewed) return apiBlob(path, false)
+    clearSession()
+  }
+  if (!response.ok) {
+    let detail = "请求失败"
+    try {
+      const payload = (await response.json()) as { detail?: string }
+      if (payload.detail) detail = payload.detail
+    } catch {
+      detail = response.statusText || detail
+    }
+    throw new ApiError(response.status, detail)
+  }
+  return response.blob()
+}
+
 export async function downloadReport(videoId: string, kind: "md" | "csv") {
   const text = await api<string>(`/api/videos/${videoId}/export.${kind}`)
   const blob = new Blob([text], { type: kind === "md" ? "text/markdown" : "text/csv" })

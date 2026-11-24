@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 import time
+from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Header, Request
@@ -18,7 +19,7 @@ from server.analysis import execute_reclassify, execute_tool
 from server.clean import CleanError
 from server.cloudbase import CloudBaseError
 from server.config import OPTIONAL_TOOLS, PROMPT_VERSION, TOOL_ORDER
-from server.events import append_event, list_events
+from server.events import append_event, events_after, list_events
 from server.export_report import render_csv, render_markdown
 from server.service import (
     AppError,
@@ -35,6 +36,11 @@ from server.service import (
     video_detail,
 )
 from server.store import MissingConfig, TASKS
+
+EXAMPLE_COMMENTS_PATH = (
+    Path(__file__).resolve().parents[1] / "files" / "exportdou-6b7f0fec-f310-49a3-a302-8063863efc01.csv"
+)
+EXAMPLE_COMMENTS_NAME = "示例评论.xlsx"
 
 
 class EmailCodeIn(BaseModel):
@@ -207,9 +213,8 @@ def register(app: FastAPI) -> None:
                 if await request.is_disconnected():
                     break
                 events = await asyncio.to_thread(list_events, store, user["uid"], video_id, detail["task"]["taskId"])
-                fresh = [item for item in events if item["seq"] > last]
+                last, fresh = events_after(events, last)
                 for item in fresh:
-                    last = item["seq"]
                     yield _sse(item)
                 task_rows = await asyncio.to_thread(store.find_all, TASKS, {"uid": user["uid"], "taskId": detail["task"]["taskId"]})
                 status = task_rows[0]["status"] if task_rows else "failed"
@@ -263,6 +268,19 @@ def register(app: FastAPI) -> None:
             return update_report(request.app.state.store, user["uid"], video_id, patch.model_dump())
         except (AppError, MissingConfig) as exc:
             _raise(exc)
+
+    @app.get("/api/examples/comments")
+    def example_comments(user: dict = Depends(get_user)) -> Response:
+        try:
+            content = EXAMPLE_COMMENTS_PATH.read_bytes()
+        except FileNotFoundError:
+            _fail(404, "示例文件不存在")
+        filename = quote(EXAMPLE_COMMENTS_NAME)
+        return Response(
+            content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+        )
 
     @app.get("/api/videos/{video_id}/export.md")
     def export_md(video_id: str, request: Request, user: dict = Depends(get_user)) -> Response:

@@ -5,3 +5,14 @@ dist
 __pycache__
 *.pyc
 .DS_Store
+
+# 复习、面试和个人笔记，不参与评见的运行和部署
+docs/评见_实现复习.md
+docs/评见_源码精读.md
+docs/评见_面试QA.md
+docs/评见_项目面试问答.md
+docs/模拟面试提问与追问.md
+docs/项目模拟面试问题与方案优化.md
+docs/Next.js核心知识速学教程.md
+docs/游戏互动题目与配置化平台_面试准备.md
+前端工程师面试问答与参考答案.docx

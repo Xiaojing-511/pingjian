@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import unittest
 from pathlib import Path
+from urllib.parse import unquote
 
+import httpx
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
+from server.analysis import AnalysisCancelled
 from server.auth import AuthError, _auth_message
 from server.config import Settings
-from server.deepseek import ModelError, complete_json_with
+from server.deepseek import DeepSeekClient, ModelError, complete_json_with
 from server.dsh_runner import fresh_session_id, map_notification, should_record
+from server.events import events_after
 from server.main import create_app
+from server.queue import AnalysisQueue
 from server.store import MemoryStore
 from server.validate import score_parts, verify_fact
 
@@ -448,6 +455,7 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(failed.status_code, 200, failed.text)
         self.assertEqual(failed.json()["task"]["status"], "failed")
         detail = client.get("/api/videos/555", headers=ana).json()
+        failed_max = max(item["seq"] for item in detail["events"])
         types = [item["type"] for item in detail["events"]]
         self.assertIn("failed", types)
         self.assertNotIn("completed", types)
@@ -460,7 +468,10 @@ class FlowTests(unittest.TestCase):
         retried = client.post("/api/videos/555/retry", headers=ana)
         self.assertEqual(retried.status_code, 200, retried.text)
         self.assertEqual(retried.json()["task"]["status"], "completed")
-        report = client.get("/api/videos/555", headers=ana).json()["report"]
+        finished_detail = client.get("/api/videos/555", headers=ana).json()
+        report = finished_detail["report"]
+        self.assertGreater(min(item["seq"] for item in finished_detail["events"]), failed_max)
+        self.assertTrue(all("JSON 无法解析" not in item["message"] for item in finished_detail["events"]))
         self.assertEqual(report["promptVersion"], "mvp-5")
         self.assertEqual(report["labelCounts"]["need"], 3)
         self.assertEqual(report["labelCounts"]["negative"], 2)
@@ -786,6 +797,20 @@ class CloudBaseStoreTests(unittest.TestCase):
         self.assertEqual(doc["updatedAt"], "2024-10-31T08:00:00+00:00")
 
 
+class ExampleFileTests(unittest.TestCase):
+    def test_download_requires_login_and_returns_the_local_example(self):
+        client, _app, _store = build_client()
+        missing = client.get("/api/examples/comments")
+        self.assertEqual(missing.status_code, 401)
+
+        headers = auth_header(client, "lee")
+        saved = client.get("/api/examples/comments", headers=headers)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.content, SAMPLE.read_bytes())
+        self.assertTrue(saved.content.startswith(b"PK"))
+        self.assertIn("示例评论.xlsx", unquote(saved.headers["content-disposition"]))
+
+
 class PageTests(unittest.TestCase):
     def test_repeated_page_is_not_counted_again(self):
         from server.cloudbase import collect_pages
@@ -906,6 +931,189 @@ class CancelTests(unittest.TestCase):
         stored = store.find_all("pingjian_tasks", {"taskId": "task-stop"})[0]
         self.assertEqual(stored["error"], "已取消分析")
         self.assertEqual(stored["progress"], {"stage": "classify_comments", "done": 40, "total": 45})
+
+
+class BusyModelTests(unittest.TestCase):
+    def _client(self, handler, waits=(0, 0, 0)):
+        return DeepSeekClient("test-key", retry_waits=waits, transport=httpx.MockTransport(handler))
+
+    def _complete(self, client):
+        return client.complete_json(
+            stage="positioning",
+            system="定位",
+            user={"title": "一条视频"},
+            required_ids=None,
+            items_key="items",
+            id_field="id",
+            max_tokens=100,
+        )
+
+    def test_503_is_retried_until_deepseek_answers(self):
+        calls = {"n": 0}
+        notes = []
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return httpx.Response(
+                    503,
+                    text='{"error":{"message":"Service is too busy.","code":"service_unavailable_error"}}',
+                )
+            return httpx.Response(200, json={"choices": [{"message": {"content": "{\"ok\": true}"}}]})
+
+        client = self._client(handler)
+        client.notice = notes.append
+        data = self._complete(client)
+        self.assertEqual(data["ok"], True)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(notes, ["DeepSeek 繁忙，正在重试", "DeepSeek 繁忙，正在重试"])
+
+    def test_400_is_not_retried(self):
+        calls = {"n": 0}
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(400, text="bad request")
+
+        client = self._client(handler)
+        with self.assertRaises(ModelError) as caught:
+            self._complete(client)
+        self.assertEqual(calls["n"], 1)
+        self.assertIn("positioning", str(caught.exception))
+        self.assertIn("400", str(caught.exception))
+
+    def test_cancel_interrupts_the_busy_wait(self):
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, text="busy")
+
+        client = self._client(handler, waits=(30,))
+        error = []
+
+        def run():
+            try:
+                self._complete(client)
+            except Exception as exc:
+                error.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        time.sleep(0.05)
+        client.request_cancel()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(error), 1)
+        self.assertIsInstance(error[0], AnalysisCancelled)
+
+
+class StreamCursorTests(unittest.TestCase):
+    def test_cursor_ahead_of_reset_events_replays_them(self):
+        last, fresh = events_after([{"seq": 2, "message": "停在 positioning"}], 9)
+        self.assertEqual(last, 2)
+        self.assertEqual(fresh[0]["message"], "停在 positioning")
+        last, fresh = events_after([], 9)
+        self.assertEqual((last, fresh), (0, []))
+
+    def test_stream_sends_the_reset_event_instead_of_only_keepalive(self):
+        client, _app, store = build_client()
+        headers = auth_header(client, "sue")
+        store.insert("pingjian_videos", {"uid": "uid-sue", "videoId": "555", "title": "t", "cleanStats": {"valid": 30}})
+        store.insert(
+            "pingjian_tasks",
+            {
+                "uid": "uid-sue",
+                "videoId": "555",
+                "taskId": "task-stream",
+                "status": "failed",
+                "error": "模型调用失败，停在 positioning",
+                "eventSeq": 2,
+                "stages": {},
+                "promptVersion": "mvp-5",
+            },
+        )
+        store.insert(
+            "pingjian_events",
+            {
+                "uid": "uid-sue",
+                "videoId": "555",
+                "taskId": "task-stream",
+                "seq": 2,
+                "type": "failed",
+                "stage": "classify_comments",
+                "message": "模型调用失败，停在 positioning",
+                "createdAt": "2026-11-03T00:00:00+00:00",
+            },
+        )
+        with client.stream("GET", "/api/videos/555/stream?after=9", headers=headers) as response:
+            self.assertEqual(response.status_code, 200)
+            body = "".join(response.iter_text())
+        self.assertIn("data:", body)
+        self.assertIn("模型调用失败，停在 positioning", body)
+        self.assertNotEqual(body.strip(), ": keepalive")
+
+
+class StuckQueueTests(unittest.TestCase):
+    def test_retry_releases_a_run_stuck_after_the_task_failed(self):
+        store = MemoryStore()
+
+        class Gate:
+            def __init__(self):
+                self.runs = 0
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def run(self, task_id, title):
+                del task_id, title
+                self.runs += 1
+                if self.runs == 1:
+                    self.entered.set()
+                    if not self.release.wait(3):
+                        raise TimeoutError("上一次编排没有被放开")
+
+            def abandon(self):
+                self.release.set()
+
+        gate = Gate()
+        queue = AnalysisQueue(store, settings(), object(), "direct", inline=False)
+        queue.orchestrator_factory = lambda: gate
+        store.insert(
+            "pingjian_tasks",
+            {
+                "uid": "uid-stuck",
+                "videoId": "555",
+                "taskId": "task-stuck",
+                "status": "queued",
+                "queueOrder": 1,
+                "stages": {},
+                "eventSeq": 4,
+                "cancelRequested": False,
+                "promptVersion": "mvp-5",
+            },
+        )
+        queue.start()
+        try:
+            queue.submit("task-stuck")
+            self.assertTrue(gate.entered.wait(2))
+            store.update_one(
+                "pingjian_tasks",
+                {"uid": "uid-stuck", "taskId": "task-stuck"},
+                {"status": "queued", "queueOrder": 2},
+            )
+            queue.submit("task-stuck")
+            deadline = time.monotonic() + 2
+            stored = {}
+            while time.monotonic() < deadline:
+                rows = store.find_all("pingjian_tasks", {"taskId": "task-stuck"})
+                stored = rows[0] if rows else {}
+                if gate.runs >= 2 and stored.get("error") == "编排没有完成报告提交":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(gate.runs, 2)
+            self.assertEqual(stored["status"], "failed")
+            self.assertEqual(stored["error"], "编排没有完成报告提交")
+            self.assertEqual(stored["queueOrder"], 2)
+        finally:
+            gate.release.set()
+            queue.stop()
 
 
 class _FailingModel:

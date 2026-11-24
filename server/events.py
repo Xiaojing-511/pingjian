@@ -54,6 +54,22 @@ def append_event(store, task: dict, event_type: str, stage: str, message: str) -
     return public_event(stored)
 
 
+def events_after(events: list[dict], last: int) -> tuple[int, list[dict]]:
+    """重试把序号重新从 1 计时，旧的 after 会比现有序号还大。
+
+    不把游标拨回来的话，新事件全部被滤掉，进度流里就只剩 keepalive。
+    """
+    if not events:
+        return (0, []) if last > 0 else (last, [])
+    newest = max(int(item.get("seq") or 0) for item in events)
+    if last > newest:
+        last = 0
+    fresh = [item for item in events if int(item.get("seq") or 0) > last]
+    if fresh:
+        last = int(fresh[-1].get("seq") or 0)
+    return last, fresh
+
+
 def list_events(store, uid: str, video_id: str | None = None, task_id: str | None = None) -> list[dict]:
     query: dict = {"uid": uid}
     if video_id:

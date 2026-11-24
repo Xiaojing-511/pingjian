@@ -2,7 +2,8 @@
 
 分类、聚类、排序、选题都从这里出去。定位也走这里。
 inspect_import 和 commit_report 不调用模型。
-一次请求失败时，只再试 1 次：要么 JSON 解析不了，要么没有覆盖全部输入 id。
+JSON 解析不了，或没有覆盖全部输入 id，同一请求再试 1 次。
+429 和 5xx 会按短退避再试几次。400 一类的请求错误不重试。
 """
 
 from __future__ import annotations
@@ -17,16 +18,21 @@ from server.analysis import AnalysisCancelled
 from server.config import DEFAULT_MODEL
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-TIMEOUT_SECONDS = 180
+TIMEOUT = httpx.Timeout(180, connect=10, write=30, pool=10)
+# 这些状态是服务端临时忙或网关失败，请求多半没有执行完。
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
 class ModelError(Exception):
     """停在哪一段、缺哪些 id，都留在异常里，任务失败时原样展示。"""
 
-    def __init__(self, stage: str, missing_ids: list[str], detail: str):
+    def __init__(self, stage: str, missing_ids: list[str], detail: str, *, retryable: bool = False, limited: bool = False):
         self.stage = stage
         self.missing_ids = missing_ids
         self.detail = detail
+        self.retryable = retryable
+        # 连接超时只再试一次。503 这种马上返回的忙状态可以多试几次。
+        self.limited = limited
         missing = ""
         if missing_ids:
             shown = "、".join(missing_ids[:12])
@@ -36,10 +42,13 @@ class ModelError(Exception):
 
 
 class DeepSeekClient:
-    def __init__(self, api_key: str, model: str | None = None):
+    def __init__(self, api_key: str, model: str | None = None, *, retry_waits: tuple[float, ...] = (2, 4, 8), transport=None):
         self.api_key = api_key.strip()
         self.model = (model or "").strip() or DEFAULT_MODEL
         self.thinking_enabled = False
+        self.retry_waits = retry_waits
+        self._transport = transport
+        self.notice: Callable[[str], None] | None = None
         self._cancel = threading.Event()
         self._clients_lock = threading.Lock()
         self._clients: set[httpx.Client] = set()
@@ -77,7 +86,7 @@ class DeepSeekClient:
             except AnalysisCancelled:
                 raise
             except ModelError as exc:
-                # HTTP 状态错误不重试，但把阶段名从 request 改成当前这一段。
+                # 忙状态的退避已经在 _post_chat 里做完。这里只把阶段名从 request 改成当前这一段。
                 raise ModelError(stage, [], exc.detail) from exc
 
         return complete_json_with(
@@ -89,6 +98,35 @@ class DeepSeekClient:
         )
 
     def _post_chat(self, *, system: str, user: dict, max_tokens: int) -> str:
+        attempts = len(self.retry_waits) + 1
+        last_error: ModelError | None = None
+        for index in range(attempts):
+            if self._cancel.is_set():
+                raise AnalysisCancelled("已取消分析")
+            try:
+                return self._post_once(system=system, user=user, max_tokens=max_tokens)
+            except AnalysisCancelled:
+                raise
+            except ModelError as exc:
+                last_error = exc
+                give_up = not exc.retryable or index >= attempts - 1 or (exc.limited and index >= 1)
+                if give_up:
+                    raise ModelError("request", [], exc.detail) from exc
+            self._tell("DeepSeek 繁忙，正在重试")
+            if self._cancel.wait(self.retry_waits[index]):
+                raise AnalysisCancelled("已取消分析")
+        raise last_error or ModelError("request", [], "没有返回内容")
+
+    def _tell(self, message: str) -> None:
+        notice = self.notice
+        if notice is None:
+            return
+        try:
+            notice(message)
+        except Exception:
+            return
+
+    def _post_once(self, *, system: str, user: dict, max_tokens: int) -> str:
         if self._cancel.is_set():
             raise AnalysisCancelled("已取消分析")
         body = {
@@ -104,7 +142,10 @@ class DeepSeekClient:
             "max_tokens": max_tokens,
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        client = httpx.Client(timeout=TIMEOUT_SECONDS)
+        client_kwargs: dict = {"timeout": TIMEOUT}
+        if self._transport is not None:
+            client_kwargs["transport"] = self._transport
+        client = httpx.Client(**client_kwargs)
         with self._clients_lock:
             self._clients.add(client)
         try:
@@ -112,7 +153,7 @@ class DeepSeekClient:
         except httpx.HTTPError as exc:
             if self._cancel.is_set():
                 raise AnalysisCancelled("已取消分析") from exc
-            raise ModelError("request", [], f"无法连接 DeepSeek：{exc}") from exc
+            raise ModelError("request", [], f"无法连接 DeepSeek：{exc}", retryable=True, limited=True) from exc
         finally:
             with self._clients_lock:
                 self._clients.discard(client)
@@ -120,7 +161,13 @@ class DeepSeekClient:
         if self._cancel.is_set():
             raise AnalysisCancelled("已取消分析")
         if response.status_code >= 400:
-            raise ModelError("request", [], f"DeepSeek 返回 {response.status_code}：{response.text[:300]}")
+            retryable = response.status_code in RETRYABLE_STATUS
+            raise ModelError(
+                "request",
+                [],
+                f"DeepSeek 返回 {response.status_code}：{response.text[:300]}",
+                retryable=retryable,
+            )
         payload = response.json()
         message = ((payload.get("choices") or [{}])[0].get("message") or {})
         # reasoning_content 是思考文本，即使接口仍返回，也不拿来当 JSON。

@@ -24,6 +24,10 @@ class AnalysisQueue:
         self._thread: threading.Thread | None = None
         self._order_lock = threading.Lock()
         self._order = 0
+        self._attempt_lock = threading.Lock()
+        self._attempt_token = 0
+        self._active_orchestrator = None
+        self.orchestrator_factory = None
 
     def next_order(self) -> int:
         with self._order_lock:
@@ -62,13 +66,11 @@ class AnalysisQueue:
                     "status": "queued",
                     "error": None,
                     "stages": {},
-                    "eventSeq": 0,
                     "progress": {"stage": "queued", "done": 0, "total": 1},
                     "updatedAt": utcnow(),
                 },
             )
             fresh = dict(task)
-            fresh["eventSeq"] = 0
             append_event(self.store, fresh, "summary", "", "服务重启，任务重新排队")
             append_event(self.store, fresh, "queued", "", "任务已排队")
             self._items.put(task["taskId"])
@@ -91,19 +93,41 @@ class AnalysisQueue:
         task = self._reload(task)
         if task.get("status") != "started" or task.get("cancelRequested"):
             return
-        append_event(self.store, task, "started", "", "开始分析")
-        videos = self.store.find_all(VIDEOS, {"uid": task["uid"], "videoId": task["videoId"]})
-        title = videos[0].get("title") if videos else ""
+        generation = int(task.get("queueOrder") or 0)
+        self._attempt_token = generation
+        stop = threading.Event()
+        watcher = threading.Thread(
+            target=self._watch_attempt,
+            args=(task, generation, stop),
+            name="pingjian-attempt-watch",
+            daemon=True,
+        )
+        watcher.start()
+        self._bind_notice(task, generation)
+        outcome: object = "ok"
         try:
-            if hasattr(self.model, "thinking_enabled"):
-                self.model.thinking_enabled = bool(task.get("thinkingEnabled", False))
-            self._orchestrator().run(task_id, title or "")
-        except AnalysisCancelled:
+            try:
+                append_event(self.store, task, "started", "", "开始分析")
+                videos = self.store.find_all(VIDEOS, {"uid": task["uid"], "videoId": task["videoId"]})
+                title = videos[0].get("title") if videos else ""
+                if hasattr(self.model, "thinking_enabled"):
+                    self.model.thinking_enabled = bool(task.get("thinkingEnabled", False))
+                self._orchestrator().run(task_id, title or "")
+            except AnalysisCancelled:
+                outcome = "cancelled"
+            except Exception as exc:
+                outcome = exc
+        finally:
+            with self._attempt_lock:
+                stop.set()
+            if hasattr(self.model, "notice"):
+                self.model.notice = None
+        if outcome == "cancelled" or not self._owns(task, generation):
             return
-        except Exception as exc:
-            current = self._reload(task)
+        current = self._reload(task)
+        if isinstance(outcome, Exception):
             if current.get("status") != "failed":
-                message = str(exc) or "分析失败"
+                message = str(outcome) or "分析失败"
                 self.store.update_one(
                     TASKS,
                     {"uid": task["uid"], "taskId": task["taskId"]},
@@ -111,7 +135,6 @@ class AnalysisQueue:
                 )
                 append_event(self.store, task, "failed", "", message)
             return
-        current = self._reload(task)
         commit_ok = ((current.get("stages") or {}).get("commit_report") or {}).get("ok")
         if commit_ok and current.get("status") != "failed":
             self.store.update_one(
@@ -145,10 +168,68 @@ class AnalysisQueue:
         rows = self.store.find_all(TASKS, {"uid": task["uid"], "taskId": task["taskId"]})
         return rows[0] if rows else task
 
+    def _owns(self, task: dict, generation: int) -> bool:
+        current = self._reload(task)
+        return int(current.get("queueOrder") or 0) == generation
+
+    def _watch_attempt(self, task: dict, generation: int, stop: threading.Event) -> None:
+        """工具已经把任务写成失败、或用户已经重新排队时，不要让上一次编排继续占着队列。"""
+        while True:
+            if stop.wait(0.4):
+                return
+            with self._attempt_lock:
+                if stop.is_set():
+                    return
+                current = self._reload(task)
+                still_running = int(current.get("queueOrder") or 0) == generation and current.get("status") == "started"
+            if still_running:
+                continue
+            self._abandon_active(generation)
+            return
+
+    def _abandon_active(self, generation: int) -> None:
+        orchestrator = self._active_orchestrator
+        if getattr(orchestrator, "attempt_token", None) != generation:
+            return
+        cancel = getattr(self.model, "request_cancel", None)
+        if cancel:
+            try:
+                cancel()
+            except Exception:
+                pass
+        abandon = getattr(orchestrator, "abandon", None)
+        if abandon:
+            try:
+                abandon()
+            except Exception:
+                return
+
+    def _bind_notice(self, task: dict, generation: int) -> None:
+        if not hasattr(self.model, "notice"):
+            return
+
+        def notice(message: str) -> None:
+            current = self._reload(task)
+            if int(current.get("queueOrder") or 0) != generation or current.get("status") != "started":
+                return
+            stage = str((current.get("progress") or {}).get("stage") or "")
+            append_event(self.store, current, "summary", stage, message)
+
+        self.model.notice = notice
+
     def _orchestrator(self):
-        if self.orchestrator_name == "direct":
-            return DirectOrchestrator(self.store, self.model)
-        return DshOrchestrator(self.store, self.settings)
+        if self.orchestrator_factory is not None:
+            orchestrator = self.orchestrator_factory()
+        elif self.orchestrator_name == "direct":
+            orchestrator = DirectOrchestrator(self.store, self.model)
+        else:
+            orchestrator = DshOrchestrator(self.store, self.settings)
+        try:
+            orchestrator.attempt_token = self._attempt_token
+        except Exception:
+            pass
+        self._active_orchestrator = orchestrator
+        return orchestrator
 
 
 def tool_names() -> tuple[str, ...]:

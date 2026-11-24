@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { ApiError, commitImport, previewImport } from "../api"
+import { ApiError, commitImport, downloadExampleComments, previewImport } from "../api"
 import { IMPORT_FIELDS, type PreviewResult } from "../types"
 
 const STAT_LABELS: { key: keyof NonNullable<PreviewResult["summary"]>; label: string }[] = [
@@ -28,6 +28,19 @@ export function ImportWizard({
   const [pending, setPending] = useState(false)
   const [importedId, setImportedId] = useState("")
   const [starting, setStarting] = useState(false)
+  const [downloadingExample, setDownloadingExample] = useState(false)
+
+  async function downloadExample() {
+    setDownloadingExample(true)
+    setError("")
+    try {
+      await downloadExampleComments()
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "示例文件下载失败")
+    } finally {
+      setDownloadingExample(false)
+    }
+  }
 
   async function startAnalysis() {
     setStarting(true)
@@ -89,6 +102,11 @@ export function ImportWizard({
             }}
           />
         </label>
+        <div className="card-actions" style={{ marginTop: 16 }}>
+          <button className="secondary" type="button" disabled={downloadingExample} onClick={() => void downloadExample()}>
+            {downloadingExample ? "下载中" : "下载示例评论文件"}
+          </button>
+        </div>
       </section>
       {preview ? (
         <section className="card">

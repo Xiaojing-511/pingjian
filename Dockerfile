@@ -17,6 +17,7 @@ COPY requirements.txt requirements-dsh.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -r requirements-dsh.txt
 
 COPY server ./server
+COPY files ./files
 COPY dsh ./dsh
 COPY dsh-plugin ./dsh-plugin
 COPY docker/entrypoint.sh /entrypoint.sh

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -104,6 +105,19 @@ class DshOrchestrator:
     def __init__(self, store, settings):
         self.store = store
         self.settings = settings
+        self._lock = threading.Lock()
+        self._harness = None
+
+    def abandon(self) -> None:
+        """任务已经失败或被重新排队时，关掉还堵在 DeepSeek 上的编排进程。"""
+        with self._lock:
+            harness = self._harness
+        if harness is None:
+            return
+        try:
+            harness.close()
+        except Exception:
+            return
 
     def run(self, task_id: str, title: str) -> None:
         try:
@@ -128,7 +142,7 @@ class DshOrchestrator:
         def on_notification(note: object) -> None:
             record_notification(self.store, task_id, note)
 
-        with DeepSeekHarness(
+        harness = DeepSeekHarness(
             dsh_home=self.settings.dsh_home,
             cwd="/tmp/pingjian-workspace",
             profile="sdk-minimal",
@@ -137,9 +151,17 @@ class DshOrchestrator:
             reasoning_effort="high",
             patches=(str(PATCH_PATH),),
             api_key=self.settings.deepseek_api_key,
-        ) as harness:
-            # 最终两句说明只存在于这次返回值里。这里不落库，避免把思考或自由发挥写成报告。
-            harness.run(user_prompt, session_id=fresh_session_id(task_id), on_notification=on_notification)
+        )
+        with self._lock:
+            self._harness = harness
+        try:
+            with harness:
+                # 最终两句说明只存在于这次返回值里。这里不落库，避免把思考或自由发挥写成报告。
+                harness.run(user_prompt, session_id=fresh_session_id(task_id), on_notification=on_notification)
+        finally:
+            with self._lock:
+                if self._harness is harness:
+                    self._harness = None
 
 
 def _as_data(note: object):

@@ -217,7 +217,6 @@ def request_analysis(store, queue, settings, uid: str, video_id: str, *, retry: 
             "error": None,
             "stages": {},
             "cancelRequested": False,
-            "eventSeq": 0,
             "queueOrder": queue.next_order(),
             "progress": {"stage": "queued", "done": 0, "total": 1},
             "model": settings.deepseek_model,
