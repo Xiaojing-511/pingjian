@@ -6,7 +6,7 @@
 
 浏览器负责登录、导入和展示。清洗、调用模型和写报告在 FastAPI 里完成。DeepSeek 做定位、分类和选题，Python 做计数、门禁和证据校验。DeepSeek Harness（DSH）按顺序调用分析工具，模型的思考文本不会进页面。
 
-在线使用：<https://pingjian.rachelzhang.cn>
+在线使用：http://82.156.15.201
 
 ## 本地运行
 
